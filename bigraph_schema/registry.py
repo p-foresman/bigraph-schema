@@ -17,31 +17,6 @@ from pprint import pformat as pf
 from bigraph_schema.protocols import local_lookup_module, function_module
 
 
-NONE_SYMBOL = '!nil'
-
-
-required_schema_keys = set([
-    '_default',
-    '_apply',
-    '_check',
-    '_serialize',
-    '_deserialize',
-    '_fold',
-])
-
-
-optional_schema_keys = set([
-    '_type',
-    '_value',
-    '_description',
-    '_type_parameters',
-    '_inherit',
-    '_divide',
-])
-
-
-type_schema_keys = required_schema_keys | optional_schema_keys
-
 
 def deep_merge_copy(dct, merge_dct):
     return deep_merge(copy.deepcopy(dct), merge_dct)
@@ -371,19 +346,3 @@ class Registry(object):
 
     def validate(self, item):
         return True
-
-
-def test_remove_omitted():
-    result = remove_omitted(
-        {'a': {}, 'b': {'c': {}, 'd': {}}},
-        {'b': {'c': {}}},
-        {'a': {'X': 1111}, 'b': {'c': {'Y': 4444}, 'd': {'Z': 99999}}})
-
-    assert 'a' not in result
-    assert result['b']['c']['Y'] == 4444
-    assert 'd' not in result['b']
-
-
-if __name__ == '__main__':
-    test_reregister_type()
-    test_remove_omitted()
