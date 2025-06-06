@@ -14,7 +14,7 @@ from pprint import pformat as pf
 from bigraph_schema import Registry, non_schema_keys, is_schema_key, deep_merge, type_parameter_key
 from bigraph_schema.parse import parse_expression
 from bigraph_schema.utilities import union_keys
-from bigraph_schema.registry import remove_omitted, set_path, transform_path
+from bigraph_schema.registry import remove_omitted, set_path, transform_path, set_star_path
 
 from bigraph_schema.type_functions import (
     registry_types, base_types, unit_types, register_base_reactions, is_empty, apply_schema, set_apply)
@@ -130,6 +130,18 @@ class TypeSystem(Registry):
         return self
 
 
+    def update_types(self, type_updates):
+        for type_key, type_data in type_updates.items():
+            is_update = self.exists(type_key)
+
+            self.register(
+                type_key,
+                type_data,
+                update=is_update)
+
+        return self
+
+
     def lookup(self, type_key, attribute):
         return self.access(type_key).get(attribute)
 
@@ -164,7 +176,8 @@ class TypeSystem(Registry):
         return registry
 
 
-    def register(self, key, schema, alternate_keys=tuple(), force=False):
+    # TODO: explain this method
+    def register(self, key, schema, alternate_keys=tuple(), strict=True, update=False):
         """
         register the schema under the given key in the registry
         """
@@ -172,6 +185,13 @@ class TypeSystem(Registry):
         if isinstance(schema, str):
             schema = self.find(schema)
         schema = copy.deepcopy(schema)
+        if self.exists(key) and update:
+            if update:
+                found = self.find(key)
+                schema = deep_merge(
+                    found,
+                    schema)
+                strict = False
 
         if '_type' not in schema:
             schema['_type'] = key
@@ -187,17 +207,9 @@ class TypeSystem(Registry):
                 inherit_type = self.access(inherit)
                 new_schema = copy.deepcopy(inherit_type)
 
-                # schema = self.resolve(
-                #     new_schema,
-                #     schema)
-
                 schema = self.merge_schemas(
                     new_schema,
                     schema)
-
-                # schema = type_merge(
-                #     new_schema,
-                #     schema)
 
                 self.inherits[key].append(
                     inherit_type)
@@ -233,7 +245,7 @@ class TypeSystem(Registry):
             key,
             schema,
             alternate_keys,
-            force)
+            strict=strict)
 
 
     def resolve_parameters(self, type_parameters, schema):
@@ -262,6 +274,10 @@ class TypeSystem(Registry):
     def merge_schemas(self, current, update):
         if current == update:
             return update
+        if current is None:
+            return update
+        if update is None:
+            return current
         if not isinstance(current, dict):
             return update
         if not isinstance(update, dict):
@@ -337,19 +353,9 @@ class TypeSystem(Registry):
                 registry_type = self.retrieve(
                     schema['_type'])
 
-                # found = self.resolve(
-                #     registry_type,
-                #     schema)
-
                 found = self.merge_schemas(
                     registry_type,
                     schema)
-
-                # found = schema.copy()
-
-                # for key, value in registry_type.items():
-                #     if  key == '_type' or key not in found:
-                #         found[key] = value
 
             else:
                 found = {
@@ -591,20 +597,33 @@ class TypeSystem(Registry):
         return validation
 
 
-    def representation(self, schema, level=None):
+    def representation(self, schema, path=None, parents=None):
         '''
         produce a string representation of the schema
         * intended to be the inverse of parse_expression()
         '''
 
+        path = path or []
+        parents = parents or []
+        schema_id = id(schema)
+
+        if schema_id in parents:
+            index = parents.index(schema_id)
+            reference = path[:index]
+            output = '/'.join(reference)
+
+            return f'/{output}'
 
         if isinstance(schema, str):
             return schema
 
         elif isinstance(schema, tuple):
             inner = [
-                self.representation(element)
-                for element in schema]
+                self.representation(
+                    element,
+                    path + [index],
+                    parents + [schema_id])
+                for index, element in enumerate(schema)]
 
             pipes = '|'.join(inner)
             return f'({pipes})'
@@ -620,7 +639,9 @@ class TypeSystem(Registry):
                         schema_key = f'_{parameter_key}'
                         if schema_key in schema:
                             parameter = self.representation(
-                                schema[schema_key])
+                                schema[schema_key],
+                                path + [schema_key],
+                                parents + [schema_id])
                             inner.append(parameter)
                         else:
                             inner.append('()')
@@ -638,7 +659,9 @@ class TypeSystem(Registry):
                 inner = {}
                 for key in non_schema_keys(schema):
                     subschema = self.representation(
-                        schema[key])
+                        schema[key],
+                        path + [key],
+                        parents + [schema_id])
 
                     inner[key] = subschema
 
@@ -716,6 +739,9 @@ class TypeSystem(Registry):
         registry = self.lookup_registry(method_key)
         method_function = registry.access(
             found)
+
+        if method_function is None:
+            raise Exception(f'no method "{method_name}" found for state {state} and schema {schema}')
 
         return method_function
 
@@ -941,6 +967,9 @@ class TypeSystem(Registry):
 
 
     def resolve_schemas(self, initial_current, initial_update):
+        if initial_current == initial_update:
+            return initial_current
+
         current = self.access(initial_current)
         update = self.access(initial_update)
 
@@ -954,7 +983,7 @@ class TypeSystem(Registry):
             outcome = update
 
         elif '_type' in current and '_type' in update and current['_type'] == update['_type']:
-            outcome = current.copy()
+            outcome = {}
 
             for key in update:
                 if key == '_type_parameters' and '_type_parameters' in current:
@@ -962,49 +991,33 @@ class TypeSystem(Registry):
                         parameter_key = f'_{parameter}'
                         if parameter in current['_type_parameters']:
                             if parameter_key in current:
-                                outcome[parameter_key] = self.resolve_schemas(
-                                    current[parameter_key],
-                                    update[parameter_key])
+                                if parameter_key in update:
+                                    outcome[parameter_key] = self.resolve_schemas(
+                                        current[parameter_key],
+                                        update[parameter_key])
+                                else:
+                                    outcome[parameter_key] = current[parameter_key]
                             elif parameter_key in update:
                                 outcome[parameter_key] = update[parameter_key]
-                            # else:
-                            #     outcome[parameter_key] = {}
                         else:
                             outcome[parameter_key] = update[parameter_key]
-                elif key not in outcome or type_parameter_key(current, key):
-                    key_update = update[key]
-                    if key_update:
-                        outcome[key] = key_update
-                else:
+                elif key not in current or type_parameter_key(current, key):
+                    if update[key]:
+                        outcome[key] = update[key]
+                    else:
+                        outcome[key] = current.get(key)
+                elif key in current and current[key]:
                     outcome[key] = self.resolve_schemas(
-                        outcome.get(key),
+                        current[key],
                         update[key])
+                else:
+                    outcome[key] = update[key]
 
         elif '_type' in update and '_type' not in current:
             outcome = self.resolve(update, current)
 
         else:
             outcome = self.resolve(current, update)
-
-        # elif '_type' in current:
-        #     outcome = self.resolve(current, update)
-
-        # elif '_type' in update:
-        #     outcome = self.resolve(update, current)
-
-        # else:
-        #     outcome = self.resolve(current, update)
-        #     outcome = current.copy()
-
-        #     for key in update:
-        #         if not key in outcome or is_schema_key(update, key):
-        #             key_update = update[key]
-        #             if key_update:
-        #                 outcome[key] = key_update
-        #         else:
-        #             outcome[key] = self.resolve_schemas(
-        #                 outcome.get(key),
-        #                 update[key])
 
         return outcome
 
@@ -1061,7 +1074,13 @@ class TypeSystem(Registry):
         return {}
 
 
-    def apply_update(self, schema, state, update):
+    def apply_update(self, schema, state, update, top_schema=None, top_state=None, path=None):
+        schema = self.access(schema)
+
+        top_schema = top_schema or schema
+        top_state = top_state or state
+        path = path or []
+
         if isinstance(update, dict) and '_react' in update:
             new_state = self.react(
                 schema,
@@ -1100,23 +1119,35 @@ class TypeSystem(Registry):
                 schema,
                 state,
                 update,
+                top_schema,
+                top_state,
+                path,
                 self)
 
         elif isinstance(schema, str) or isinstance(schema, list):
             schema = self.access(schema)
-            state = self.apply_update(schema, state, update)
+            state = self.apply_update(
+                schema,
+                state,
+                update,
+                top_schema=top_schema,
+                top_state=top_state,
+                path=path)
 
         elif isinstance(update, dict):
             for key, branch in update.items():
                 if key not in schema:
                     raise Exception(
-                        f'trying to update a key that is not in the schema'
+                        f'trying to update a key that is not in the schema '
                         f'for state: {key}\n{state}\nwith schema:\n{schema}')
                 else:
                     subupdate = self.apply_update(
                         self.access(schema[key]),
                         state[key],
-                        branch)
+                        branch,
+                        top_schema=top_schema,
+                        top_state=top_state,
+                        path=path + [key])
 
                     state[key] = subupdate
         else:
@@ -1130,7 +1161,10 @@ class TypeSystem(Registry):
     def apply(self, original_schema, initial, update):
         schema = self.access(original_schema)
         state = copy.deepcopy(initial)
-        return self.apply_update(schema, state, update)
+        return self.apply_update(
+            schema,
+            state,
+            update)
 
 
     def apply_slice(self, schema, state, path, update):
@@ -1273,11 +1307,12 @@ class TypeSystem(Registry):
 
 
     def set_slice(self, schema, state, path, target_schema, target_state, defer=False):
-
         '''
         Makes a local modification to the schema/state at the path, and
         returns the top_schema and top_state
         '''
+
+        path = resolve_path(path)
 
         if len(path) == 0:
             # deal with paths of length 0
@@ -1323,8 +1358,6 @@ class TypeSystem(Registry):
                 result_state)
 
         else:
-            path = resolve_path(path)
-
             head = path[0]
             tail = path[1:]
 
@@ -1333,20 +1366,55 @@ class TypeSystem(Registry):
                 state,
                 head)
 
-            result_schema, result_state = self.set_slice(
-                down_schema,
-                down_state,
-                tail,
-                target_schema,
-                target_state,
-                defer=defer)
+            if head == '*':
+                result_schema, result_state = down_schema, down_state
+                for key in down_state:
+                    if key in target_state:
+                        subtarget_schema, subtarget_state = self.slice(
+                            target_schema,
+                            target_state,
+                            key)
 
-            return self.bind(
-                schema,
-                state,
-                head,
-                result_schema,
-                result_state)
+                        try:
+                            result_schema, result_state = self.set_slice(
+                                result_schema,
+                                result_state,
+                                tail,
+                                subtarget_schema,
+                                subtarget_state,
+                                defer=defer)
+
+                        except Exception as e:
+                            raise Exception(
+                                f'failed to set_slice at path {path}\n{str(e)}')
+
+                        schema, state = self.bind(
+                            schema,
+                            state,
+                            key,
+                            result_schema,
+                            result_state)
+
+                return schema, state
+
+            else:
+                try:
+                    result_schema, result_state = self.set_slice(
+                        down_schema,
+                        down_state,
+                        tail,
+                        target_schema,
+                        target_state,
+                        defer=defer)
+                except Exception as e:
+                    raise Exception(f'failed to set_slice at path {path}\n{str(e)}')
+
+                return self.bind(
+                    schema,
+                    state,
+                    head,
+                    result_schema,
+                    result_state)
 
 
     def serialize(self, schema, state):
@@ -1371,10 +1439,12 @@ class TypeSystem(Registry):
             state,
             'deserialize')
 
-        return deserialize_function(
+        deserialized = deserialize_function(
             schema,
             state,
             self)
+
+        return deserialized
 
 
     def fill_ports(self, interface, wires=None, state=None, top_schema=None, top_state=None, path=None):
@@ -1552,7 +1622,7 @@ class TypeSystem(Registry):
                 if inner_view is not None:
                     result[port_key] = inner_view
         else:
-            raise Exception(f'trying to project state with these ports:\n{schema}\nbut not sure what these wires are:\n{wires}')
+            raise Exception(f'trying to view state with these ports:\n{schema}\nbut not sure what these wires are:\n{wires}')
 
         return result
 
@@ -1596,7 +1666,7 @@ class TypeSystem(Registry):
 
         if isinstance(wires, (list, tuple)):
             destination = resolve_path(list(path) + list(wires))
-            result = set_path(
+            result = set_star_path(
                 result,
                 destination,
                 states)
@@ -1968,6 +2038,23 @@ class TypeSystem(Registry):
                 state)
 
         return top_schema, top_state
+
+
+    def wire_schema(self, schema, wires, path=None):
+        outcome = {}
+        path = path or []
+
+        if isinstance(wires, dict):
+            for key, subwires in wires.items():
+                outcome[key] = self.wire_schema(
+                    schema,
+                    wires[key],
+                    path + [key])
+
+        else:
+            _, outcome = self.slice('schema', schema, wires)
+
+        return outcome
 
 
     def hydrate(self, schema, state):

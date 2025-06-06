@@ -7,10 +7,10 @@ import pprint
 import numpy as np
 from dataclasses import asdict
 
+from bigraph_schema import TypeSystem, local_lookup_module
 from bigraph_schema.type_functions import (
     divide_longest, base_types, accumulate, to_string, deserialize_integer, apply_schema, data_module)
 from bigraph_schema.utilities import compare_dicts, NONE_SYMBOL
-from bigraph_schema import TypeSystem
 from bigraph_schema.units import units
 from bigraph_schema.registry import establish_path, remove_omitted
 
@@ -74,7 +74,7 @@ def test_reregister_type(core):
             'A', {'_default': 'b'},
             strict=True)
 
-    core.register('A', {'_default': 'b'})
+    core.register('A', {'_default': 'b'}, strict=False)
 
     assert core.access('A')['_default'] == 'b'
 
@@ -838,7 +838,7 @@ def test_inherits_from(core):
 
     assert core.inherits_from(
         'tree[path]',
-        'tree[list[string]]')
+        'tree[list[string~integer]]')
 
     assert not core.inherits_from(
         'tree[path]',
@@ -905,11 +905,10 @@ def test_apply_schema(core):
         'c': 'string',
         'd': ('number', 'float', 'path')}
 
-    applied = apply_schema(
+    applied = core.apply(
         'schema',
         current,
-        update,
-        core)
+        update)
 
     assert applied['a']['_type'] == 'float'
     assert applied['b']['_value']['_type'] == 'path'
@@ -919,7 +918,7 @@ def test_apply_schema(core):
     assert applied['d']['_2']['_type'] == 'path'
 
 
-def apply_foursquare(schema, current, update, core):
+def apply_foursquare(schema, current, update, top_schema, top_state, path, core):
     if isinstance(current, bool) or isinstance(update, bool):
         return update
     else:
@@ -928,7 +927,10 @@ def apply_foursquare(schema, current, update, core):
                 schema,
                 current[key],
                 value,
-                core)
+                top_schema=top_schema,
+                top_state=top_state,
+                path=path,
+                core=core)
 
         return current
 
@@ -1225,6 +1227,29 @@ def test_reaction(core):
                 'daughters': [
                     {'id': 'daughter1', 'ratio': 0.3},
                     {'id': 'daughter2', 'ratio': 0.7}]}}}
+
+
+def A(a):
+    return a * 5
+
+def B(b):
+    return b + 11
+
+def test_function_type(core):
+    A_serialized = core.serialize(
+        'function',
+        A)
+
+    A_deserialized = core.deserialize(
+        'function',
+        A_serialized)
+
+    C = core.apply(
+        'function',
+        A_deserialized,
+        B)
+
+    assert C(6) == 41
 
 
 def test_map_type(core):
@@ -1847,6 +1872,76 @@ def test_slice(core):
         ['top', 'AAAA', 'BBBB', 'CCCC', 3])[1] is None
 
 
+def test_star_path(core):
+    nested_schema = 'map[map[green:float|yellow:integer|blue:string]]'
+    nested_state = {
+        'aaa': {
+            'bbb': {
+                'green': 1.1,
+                'yellow': 55,
+                'blue': 'what'},
+            'ccc': {
+                'green': 9999.4,
+                'yellow': 11,
+                'blue': 'umbrella'}}}
+
+    # TODO: can you do everything the * is doing here with _path instead?
+    nested_path = ['aaa', '*', 'green']
+
+    schema, state = core.slice(
+        nested_schema,
+        nested_state,
+        nested_path)
+
+    assert schema['_value']['_type'] == 'float'
+    assert state['ccc'] == 9999.4
+
+
+def test_star_view_project(core):
+    schema = {
+        'edges': 'map[edge[view:map[float],project:map[string]]]',
+        'stores': 'map[map[green:float|yellow:integer|blue:string]]'}
+
+    state = {
+        'edges': {
+            'edge': {
+                'inputs': {
+                    'view': ['..', 'stores', 'aaa', '*', 'green']},
+                'outputs': {
+                    'project': ['..', 'stores', 'aaa', '*', 'blue']}}},
+        'stores': {
+            'aaa': {
+                'bbb': {
+                    'green': 1.1,
+                    'yellow': 55,
+                    'blue': 'what'},
+                'ccc': {
+                    'green': 9999.4,
+                    'yellow': 11,
+                    'blue': 'umbrella'}}}}
+
+    edge_path = ['edges', 'edge']
+
+    view = core.view_edge(
+        schema,
+        state,
+        edge_path)
+
+    internal = {
+        'project': {
+            'bbb': 'everything',
+            'ccc': 'inside out'}}
+
+    project = core.project_edge(
+        schema,
+        state,
+        edge_path,
+        internal)
+
+    assert view['view']['bbb'] == state['stores']['aaa']['bbb']['green']
+    assert project['stores']['aaa']['ccc']['blue'] == internal['project']['ccc']
+
+
 def test_set_slice(core):
     float_schema, float_state = core.set_slice(
         'map[float]',
@@ -2262,7 +2357,7 @@ def test_merge(core):
     assert 'D' in top_state
     assert top_schema['D']['_type'] == 'float'
 
-def test_remove_omitted():
+def test_remove_omitted(core=None):
     result = remove_omitted(
         {'a': {}, 'b': {'c': {}, 'd': {}}},
         {'b': {'c': {}}},
@@ -2271,6 +2366,138 @@ def test_remove_omitted():
     assert 'a' not in result
     assert result['b']['c']['Y'] == 4444
     assert 'd' not in result['b']
+
+
+def test_union_key_error(core):
+    schema = core.access('map[map[float]]')
+    state = {
+        'a': {'b': 1.1},
+        'c': {'d': 2.2},
+        'e': 3.3  # this should be an error
+    }
+    generate_method = core.choose_method(schema, state, 'generate')
+
+    # assert that the Exception is raised
+    with pytest.raises(Exception):
+        result = generate_method(core, schema, state)
+
+
+def fix_test_slice_edge(core):
+    initial_schema = {
+        'edge': {
+            '_type': 'edge',
+            '_inputs': {
+                'a': 'float',
+                'b': {'c': 'float', 'd': 'string'},
+                'e': {'f': 'array[(3|3),float]'}},
+            '_outputs': {
+                'g': 'float',
+                'h': {'i': {'j': 'map[integer]'}},
+                'k': {'l': 'array[(3|3),float]'}}}}
+
+    initial_state = {
+        'JJJJ': {'MMMM': 55555},
+        'edge': {
+            'inputs': {
+                'a': ['AAAA'],
+                'b': {
+                    'c': ['CCCC'],
+                    'd': ['DDDD']},
+                'e': ['EEEE']},
+            'outputs': {
+                'g': ['GGGG'],
+                'h': {'i': {'j': ['JJJJ']}},
+                'k': {'l': ['LLLL', 'LLLLL', 'LLLLLL']}}}}
+
+    schema, state = core.generate(initial_schema, initial_state)
+
+    inner_schema, inner_state = core.slice(
+        schema,
+        state,
+        ['edge', 'outputs', 'h', 'i', 'j', 'MMMM'])
+
+    assert inner_schema['_type'] == 'integer'
+    assert inner_state == 55555
+
+
+def fix_test_complex_wiring(core):
+    initial_schema = {
+        'edge': {
+            '_type': 'edge',
+            '_inputs': {
+                'a': {
+                    'b': 'float',
+                    'c': 'float',
+                    'd': 'float'}},
+            '_outputs': {}}}
+
+    initial_state = {
+        'edge': {
+            'inputs': {
+                'a': {
+                    '_path': ['AAAA', 'AAAAA'],
+                    'b': ['BBBB'],
+                    'c': ['CCCC', 'CCCCC']}}}}
+
+    schema, state = core.generate(
+        initial_schema,
+        initial_state)
+
+    assert state['AAAA']['AAAAA']['BBBB'] == 0.0
+    assert state['AAAA']['AAAAA']['CCCC']['CCCCC'] == 0.0
+    assert state['AAAA']['AAAAA']['d'] == 0.0
+
+
+def test_tree_equivalence(core):
+    initial_state = {
+        'store1': {
+            'store1.1': '1.0'}}
+
+    # create a nested store type and register it
+    store11 = {
+        'store1.1': {
+            '_type': 'float',
+            '_default': '1.0'}}
+
+    core.register('store1.1', store11)
+
+    # create a tree schema that uses this type
+    store_tree = {
+        '_type': 'tree',
+        '_leaf': 'store1.1'}
+
+    # interpret the state as a simple tree of float
+    store_schema, store_state = core.generate(
+        'tree[float]',
+        initial_state)
+
+    # use the nested type to fill in the state
+    tree_schema, tree_state = core.generate(
+        store_tree,
+        {'store1': None})
+
+    # use the nested type but with an empty dict instead
+    fill_schema, fill_state = core.generate(
+        store_tree,
+        {'store1': {}})
+
+    # supply the whole schema at once instead of registering
+    inline_schema, inline_state = core.generate({
+        '_type': 'tree',
+        '_leaf': {
+            'store1.1': {
+                '_type': 'float',
+                '_default': '1.0'}}},
+        {'store1': {}})
+
+    # here is the state we expect from each of these calls
+    # to generate
+    target_state = {
+        'store1': {
+            'store1.1': 1.0}}
+
+    # all of the resulting generated states are the same
+    assert store_state == tree_state == fill_state == inline_state == target_state
 
 
 if __name__ == '__main__':
@@ -2304,6 +2531,7 @@ if __name__ == '__main__':
     test_maybe_type(core)
     test_tuple_type(core)
     test_array_type(core)
+    test_function_type(core)
     test_union_type(core)
     test_union_values(core)
     test_infer_edge(core)
@@ -2322,4 +2550,10 @@ if __name__ == '__main__':
     test_generate(core)
     test_edge_cycle(core)
     test_merge(core)
-    test_remove_omitted()
+    test_remove_omitted(core)
+    test_union_key_error(core)
+    test_tree_equivalence(core)
+    test_star_view_project(core)
+
+    # test_slice_edge(core)
+    # test_complex_wiring(core)
